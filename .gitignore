@@ -1,0 +1,30 @@
+# Secrets and local configuration
+.env
+backend/.env
+*.pem
+*.key
+
+# Python environments and cache
+backend/venv/
+venv/
+**/__pycache__/
+*.py[cod]
+
+# Local data stores and generated data
+backend/data/
+*.db
+*.sqlite
+
+# JavaScript dependencies and builds
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# AWS SAM build artifacts
+.aws-sam/
+.aws-sam-eventbridge/
+
+# Editor and OS files
+.vscode/
+.DS_Store
+Thumbs.db
