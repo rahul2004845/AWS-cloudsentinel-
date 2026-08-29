@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Low-latency EventBridge ingestion for CloudSentinel.
+
+Parameters:
+  BackendIngestUrl:
+    Type: String
+    Description: Public HTTPS URL ending in /api/ingest. Localhost cannot be reached by Lambda.
+  IngestApiKey:
+    Type: String
+    NoEcho: true
+    Description: CloudSentinel INGEST_API_KEYS value.
+
+  QueueVisibilityTimeoutSeconds:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    Description: Must exceed the Lambda timeout so a message is not processed twice.
+
+  OrganizationId:
+    Type: String
+    Default: ''
+    Description: Optional AWS Organization ID (for example o-abc123). Enables the central member-account event bus.
+
+Conditions:
+  HasOrganizationId: !Not [!Equals [!Ref OrganizationId, '']]
+
+Resources:
+  CloudSentinelIngressDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: cloudsentinel-ingress-dlq
+      MessageRetentionPeriod: 1209600 # 14 days for investigation and replay
+
+  CloudSentinelIngressQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: cloudsentinel-ingress
+      VisibilityTimeout: !Ref QueueVisibilityTimeoutSeconds
+      MessageRetentionPeriod: 345600 # 4 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CloudSentinelIngressDlq.Arn
+        maxReceiveCount: 5
+
+  CloudSentinelIngressQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref CloudSentinelIngressQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeToSendEvents
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt CloudSentinelIngressQueue.Arn
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  CloudSentinelOrganizationBus:
+    Type: AWS::Events::EventBus
+    Condition: HasOrganizationId
+    Properties:
+      Name: cloudsentinel-organization-events
+
+  CloudSentinelOrganizationBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Condition: HasOrganizationId
+    Properties:
+      StatementId: AllowOrganizationMemberAccounts
+      Action: events:PutEvents
+      Principal: '*'
+      EventBusName: !Ref CloudSentinelOrganizationBus
+      Condition:
+        Type: StringEquals
+        Key: aws:PrincipalOrgID
+        Value: !Ref OrganizationId
+
+  OrganizationForwardedEventsRule:
+    Type: AWS::Events::Rule
+    Condition: HasOrganizationId
+    Properties:
+      Description: Sends member-account events forwarded through the organization event bus to the durable ingestion queue.
+      EventBusName: !Ref CloudSentinelOrganizationBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+          - aws.iam
+          - aws.ec2
+          - aws.cloudtrail
+          - aws.signin
+          - aws.securityhub
+          - aws.guardduty
+      Targets:
+        - Arn: !GetAtt CloudSentinelIngressQueue.Arn
+          Id: CloudSentinelOrganizationQueue
+
+  CloudSentinelIngestor:
+    Type: AWS::Serverless::Function
+    Properties:
+      # Keep the deployment package intentionally small. The backend folder also
+      # contains a local venv, database and development artifacts and must never
+      # be packaged into this Lambda.
+      CodeUri: lambda_ingestor/
+      Handler: lambda_ingestor.lambda_handler
+      Runtime: python3.11
+      MemorySize: 256
+      Timeout: 15
+      Environment:
+        Variables:
+          BACKEND_INGEST_URL: !Ref BackendIngestUrl
+          INGEST_API_KEY: !Ref IngestApiKey
+      Events:
+        IngressQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt CloudSentinelIngressQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  ManagementEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Sends relevant CloudTrail management and sign-in activity to CloudSentinel with low latency.
+      EventBusName: default
+      State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
+      EventPattern:
+        source:
+          - aws.s3
+          - aws.iam
+          - aws.ec2
+          - aws.cloudtrail
+          - aws.signin
+        detail-type:
+          - AWS API Call via CloudTrail
+          - AWS Console Signin via CloudTrail
+      Targets:
+        - Arn: !GetAtt CloudSentinelIngressQueue.Arn
+          Id: CloudSentinelManagementQueue
+
+  NativeFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Sends GuardDuty and Security Hub findings to the shared CloudSentinel incident queue.
+      EventBusName: default
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.securityhub
+          - aws.guardduty
+      Targets:
+        - Arn: !GetAtt CloudSentinelIngressQueue.Arn
+          Id: CloudSentinelNativeFindingsQueue
+
+Outputs:
+  IngressQueueUrl:
+    Description: Primary durable ingestion queue URL.
+    Value: !Ref CloudSentinelIngressQueue
+  IngressQueueArn:
+    Description: Primary queue ARN; use it for monitoring and alerts.
+    Value: !GetAtt CloudSentinelIngressQueue.Arn
+  DeadLetterQueueUrl:
+    Description: Failed events are retained here after five failed deliveries.
+    Value: !Ref CloudSentinelIngressDlq
+  DeadLetterQueueArn:
+    Description: DLQ ARN for CloudWatch alarm subscriptions.
+    Value: !GetAtt CloudSentinelIngressDlq.Arn
+  OrganizationEventBusArn:
+    Condition: HasOrganizationId
+    Description: Pass this ARN to the Organizations StackSet member forwarder.
+    Value: !GetAtt CloudSentinelOrganizationBus.Arn

@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CloudSentinel member-account forwarder. Deploy this template as an AWS
+  Organizations CloudFormation StackSet to forward security events to the
+  central monitoring account's EventBridge event bus.
+
+Parameters:
+  CentralEventBusArn:
+    Type: String
+    Description: ARN of the EventBridge bus in the CloudSentinel central monitoring account.
+
+Resources:
+  CloudSentinelMemberForwardingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Forward selected CloudTrail, Security Hub and GuardDuty events to the central CloudSentinel account.
+      EventBusName: default
+      State: ENABLED_WITH_ALL_CLOUDTRAIL_MANAGEMENT_EVENTS
+      EventPattern:
+        source:
+          - aws.s3
+          - aws.iam
+          - aws.ec2
+          - aws.cloudtrail
+          - aws.signin
+          - aws.securityhub
+          - aws.guardduty
+      Targets:
+        - Arn: !Ref CentralEventBusArn
+          Id: CloudSentinelCentralEventBus
+          RoleArn: !GetAtt CloudSentinelEventBridgeForwarderRole.Arn
+
+  CloudSentinelEventBridgeForwarderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ForwardToCloudSentinelCentralBus
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Ref CentralEventBusArn
+
